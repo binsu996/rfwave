@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import types
 import sys
 import torch.distributed as dist
+import librosa
 
 from dataclasses import dataclass
 from pytorch_lightning import LightningDataModule
@@ -78,7 +79,8 @@ class VocosDataModule(LightningDataModule):
             if train:
                 np.random.shuffle(batch_sampler)
             if num_replicas > 1:
-                batch_sampler = [x[rank::num_replicas] for x in batch_sampler if len(x) % num_replicas == 0]
+                batch_sampler = [x[rank::num_replicas]
+                                 for x in batch_sampler if len(x) % num_replicas == 0]
             dataloader = DataLoader(
                 dataset, num_workers=cfg.num_workers, batch_sampler=batch_sampler,
                 pin_memory=True, collate_fn=collate_fn)
@@ -163,7 +165,7 @@ class VocosDataset(Dataset):
     def __init__(self, cfg: DataConfig, train: bool):
         assert cfg.task == "voc"
         with open(cfg.filelist_path) as f:
-            self.filelist = f.read().splitlines()
+            self.filelist = f.read().split("\n")
         self.sampling_rate = cfg.sampling_rate
         self.num_samples = cfg.num_samples
         self.train = train
@@ -176,7 +178,9 @@ class VocosDataset(Dataset):
         audio_path = self.filelist[index]
         fn = Path(audio_path).name
         if self._cache is None or fn not in self._cache:
-            y, sr = torchaudio.load(audio_path)
+            # y, sr = torchaudio.load(f'{audio_path}')
+            y, sr = librosa.load(audio_path, sr=None, mono=True)
+            y = torch.Tensor(y).unsqueeze(0)
             if self._cache is not None:
                 self._cache[fn] = (y, sr)
         else:
@@ -185,19 +189,22 @@ class VocosDataset(Dataset):
             # mix to mono
             y = y.mean(dim=0, keepdim=True)
         if sr != self.sampling_rate:
-            y = torchaudio.functional.resample(y, orig_freq=sr, new_freq=self.sampling_rate)
+            y = torchaudio.functional.resample(
+                y, orig_freq=sr, new_freq=self.sampling_rate)
         if y.size(-1) < self.num_samples:
             pad_length = self.num_samples - y.size(-1)
             padding_tensor = y.repeat(1, 1 + pad_length // y.size(-1))
             y = torch.cat((y, padding_tensor[:, :pad_length]), dim=1)
         elif self.train:
-            start = np.random.randint(low=0, high=y.size(-1) - self.num_samples + 1)
-            y = y[:, start : start + self.num_samples]
+            start = np.random.randint(
+                low=0, high=y.size(-1) - self.num_samples + 1)
+            y = y[:, start: start + self.num_samples]
         else:
             # During validation, take always the first segment for determinism
             y = y[:, : self.num_samples]
         gain = np.random.uniform(-1, -6) if self.train else -3
-        y, _ = torchaudio.sox_effects.apply_effects_tensor(y, sr, [["norm", f"{gain:.2f}"]])
+        y, _ = torchaudio.sox_effects.apply_effects_tensor(
+            y, sr, [["norm", f"{gain:.2f}"]])
         return y[0]
 
 
@@ -230,19 +237,22 @@ class ArkDataset(torch.utils.data.Dataset):
             # mix to mono
             y = y.mean(dim=0, keepdim=True)
         if sr != self.sampling_rate:
-            y = torchaudio.functional.resample(y, orig_freq=sr, new_freq=self.sampling_rate)
+            y = torchaudio.functional.resample(
+                y, orig_freq=sr, new_freq=self.sampling_rate)
         if y.size(-1) < self.num_samples:
             pad_length = self.num_samples - y.size(-1)
             padding_tensor = y.repeat(1, 1 + pad_length // y.size(-1))
             y = torch.cat((y, padding_tensor[:, :pad_length]), dim=1)
         elif self.train:
-            start = np.random.randint(low=0, high=y.size(-1) - self.num_samples + 1)
-            y = y[:, start : start + self.num_samples]
+            start = np.random.randint(
+                low=0, high=y.size(-1) - self.num_samples + 1)
+            y = y[:, start: start + self.num_samples]
         else:
             # During validation, take always the first segment for determinism
             y = y[:, : self.num_samples]
         gain = np.random.uniform(-1, -6) if self.train else -3
-        y, _ = torchaudio.sox_effects.apply_effects_tensor(y, sr, [["norm", f"{gain:.2f}"]])
+        y, _ = torchaudio.sox_effects.apply_effects_tensor(
+            y, sr, [["norm", f"{gain:.2f}"]])
         return y[0]
 
 
@@ -297,28 +307,34 @@ class TTSDatasetSegment(Dataset):
         k, audio_fp, alignment_fp, *_ = self.filelist[index].split("|")
         if self._cache is None or k not in self._cache:
             alignment = torch.load(alignment_fp, map_location="cpu")
-            token_ids = torch.tensor([self.phone2id[str(tk)] for tk in alignment['tokens']])
+            token_ids = torch.tensor([self.phone2id[str(tk)]
+                                     for tk in alignment['tokens']])
             durations = alignment['durations']
             y, sr = torchaudio.load(audio_fp)
             if y.size(0) > 1:
                 # mix to mono
                 y = y.mean(dim=0, keepdim=True)
             if sr != self.sampling_rate:
-                y = torchaudio.functional.resample(y, orig_freq=sr, new_freq=self.sampling_rate)
-            up_durations = upsample_durations(durations, y.size(1), self.hop_length, self.padding)
+                y = torchaudio.functional.resample(
+                    y, orig_freq=sr, new_freq=self.sampling_rate)
+            up_durations = upsample_durations(
+                durations, y.size(1), self.hop_length, self.padding)
             if self._cache is not None:
                 self._cache[k] = (y, token_ids, up_durations)
         else:
             y, token_ids, up_durations = self._cache[k]
 
-        num_frames = self.num_samples // self.hop_length + (1 if self.padding == "center" else 0)
-        y = y.detach().clone()[:, :y.size(1) // self.hop_length * self.hop_length]
+        num_frames = self.num_samples // self.hop_length + \
+            (1 if self.padding == "center" else 0)
+        y = y.detach().clone()[:, :y.size(1) //
+                               self.hop_length * self.hop_length]
         token_ids = token_ids.detach().clone()
         up_durations = up_durations.detach().clone()
         cs_durations = torch.cumsum(up_durations, 0)
 
         if y.size(-1) < self.num_samples + self.hop_length:
-            repeats = np.ceil((self.num_samples + self.hop_length) / y.size(-1)).astype(np.int64)
+            repeats = np.ceil(
+                (self.num_samples + self.hop_length) / y.size(-1)).astype(np.int64)
             y = y.repeat(1, repeats)
             token_ids = token_ids.repeat(repeats)
             up_durations = up_durations.repeat(repeats)
@@ -328,22 +344,27 @@ class TTSDatasetSegment(Dataset):
         assert total_frames - num_frames + 1 > 0, (
             f"y length {y.size(-1)}, total_frames {total_frames}, num_frames {num_frames}")
         if self.train:
-            start_frame = np.random.randint(low=0, high=total_frames - num_frames + 1)
+            start_frame = np.random.randint(
+                low=0, high=total_frames - num_frames + 1)
             start = start_frame * self.hop_length
             end_frame = start_frame + num_frames
             y = y[:, start: start + self.num_samples]
-            start_phone_idx = torch.searchsorted(cs_durations, start_frame, right=True)
-            end_phone_idx = torch.searchsorted(cs_durations, end_frame, right=False)
+            start_phone_idx = torch.searchsorted(
+                cs_durations, start_frame, right=True)
+            end_phone_idx = torch.searchsorted(
+                cs_durations, end_frame, right=False)
         else:
             # During validation, take always the first segment for determinism
             y = y[:, : self.num_samples]
             start_frame = 0
             end_frame = start_frame + num_frames
             start_phone_idx = 0
-            end_phone_idx = torch.searchsorted(cs_durations, end_frame, right=False)
+            end_phone_idx = torch.searchsorted(
+                cs_durations, end_frame, right=False)
 
         token_ids = token_ids[start_phone_idx: end_phone_idx + 1]
-        durations = up_durations[start_phone_idx: end_phone_idx + 1].detach().clone()
+        durations = up_durations[start_phone_idx: end_phone_idx +
+                                 1].detach().clone()
         if end_phone_idx != start_phone_idx:
             first_num_frames = cs_durations[start_phone_idx] - start_frame
             last_num_frames = end_frame - cs_durations[end_phone_idx - 1]
@@ -353,7 +374,8 @@ class TTSDatasetSegment(Dataset):
             durations[0] = end_frame - start_frame
 
         gain = np.random.uniform(-1, -6) if self.train else -3
-        y, _ = torchaudio.sox_effects.apply_effects_tensor(y, self.sampling_rate, [["norm", f"{gain:.2f}"]])
+        y, _ = torchaudio.sox_effects.apply_effects_tensor(
+            y, self.sampling_rate, [["norm", f"{gain:.2f}"]])
         assert torch.sum(durations) == num_frames, (
             f"{k}, sum durations {torch.sum(durations)}, num frames: {num_frames}, "
             f"start_phone_idx: {start_phone_idx}, start_frame: {start_frame}, durations: {durations}")
@@ -386,22 +408,27 @@ class TTSDataset(Dataset):
         k, audio_fp, alignment_fp, *_ = self.filelist[index].split("|")
         if self._cache is None or k not in self._cache:
             alignment = torch.load(alignment_fp, map_location="cpu")
-            token_ids = torch.tensor([self.phone2id[str(tk)] for tk in alignment['tokens']])
+            token_ids = torch.tensor([self.phone2id[str(tk)]
+                                     for tk in alignment['tokens']])
             durations = alignment['durations']
             y, sr = torchaudio.load(audio_fp)
             if y.size(0) > 1:
                 # mix to mono
                 y = y.mean(dim=0, keepdim=True)
             if sr != self.sampling_rate:
-                y = torchaudio.functional.resample(y, orig_freq=sr, new_freq=self.sampling_rate)
-            up_durations = upsample_durations(durations, y.size(1), self.hop_length, self.padding)
+                y = torchaudio.functional.resample(
+                    y, orig_freq=sr, new_freq=self.sampling_rate)
+            up_durations = upsample_durations(
+                durations, y.size(1), self.hop_length, self.padding)
             if self._cache is not None:
                 self._cache[k] = (y, token_ids, up_durations)
         else:
             y, token_ids, up_durations = self._cache[k]
 
-        y = y.detach().clone()[:, :y.size(1) // self.hop_length * self.hop_length]
-        num_frames = y.size(1) // self.hop_length + (1 if self.padding == "center" else 0)
+        y = y.detach().clone()[:, :y.size(1) //
+                               self.hop_length * self.hop_length]
+        num_frames = y.size(1) // self.hop_length + \
+            (1 if self.padding == "center" else 0)
         token_ids = token_ids.detach().clone()
         durations = up_durations.detach().clone()
 
@@ -409,7 +436,8 @@ class TTSDataset(Dataset):
         start_phone_idx = 0
 
         gain = np.random.uniform(-1, -6) if self.train else -3
-        y, _ = torchaudio.sox_effects.apply_effects_tensor(y, self.sampling_rate, [["norm", f"{gain:.2f}"]])
+        y, _ = torchaudio.sox_effects.apply_effects_tensor(
+            y, self.sampling_rate, [["norm", f"{gain:.2f}"]])
         assert torch.sum(durations) == num_frames, (
             f"{k}, sum durations {torch.sum(durations)}, num frames: {num_frames}, "
             f"start_phone_idx: {start_phone_idx}, start_frame: {start_frame}, durations: {durations}")
@@ -443,28 +471,34 @@ class TTSCtxDatasetSegment(Dataset):
         k, audio_fp, alignment_fp, *_ = self.filelist[index].split("|")
         if self._cache is None or k not in self._cache:
             alignment = torch.load(alignment_fp, map_location="cpu")
-            token_ids = torch.tensor([self.phone2id[str(tk)] for tk in alignment['tokens']])
+            token_ids = torch.tensor([self.phone2id[str(tk)]
+                                     for tk in alignment['tokens']])
             durations = alignment['durations']
             y, sr = torchaudio.load(audio_fp)
             if y.size(0) > 1:
                 # mix to mono
                 y = y.mean(dim=0, keepdim=True)
             if sr != self.sampling_rate:
-                y = torchaudio.functional.resample(y, orig_freq=sr, new_freq=self.sampling_rate)
-            up_durations = upsample_durations(durations, y.size(1), self.hop_length, self.padding)
+                y = torchaudio.functional.resample(
+                    y, orig_freq=sr, new_freq=self.sampling_rate)
+            up_durations = upsample_durations(
+                durations, y.size(1), self.hop_length, self.padding)
             if self._cache is not None:
                 self._cache[k] = (y, token_ids, up_durations)
         else:
             y, token_ids, up_durations = self._cache[k]
 
-        num_frames = self.num_samples // self.hop_length + (1 if self.padding == "center" else 0)
-        y = y.detach().clone()[:, :y.size(1) // self.hop_length * self.hop_length]
+        num_frames = self.num_samples // self.hop_length + \
+            (1 if self.padding == "center" else 0)
+        y = y.detach().clone()[:, :y.size(1) //
+                               self.hop_length * self.hop_length]
         token_ids = token_ids.detach().clone()
         up_durations = up_durations.detach().clone()
         cs_durations = torch.cumsum(up_durations, 0)
 
         if y.size(-1) < self.num_samples + self.hop_length:
-            repeats = np.ceil((self.num_samples + self.hop_length) / y.size(-1)).astype(np.int64)
+            repeats = np.ceil(
+                (self.num_samples + self.hop_length) / y.size(-1)).astype(np.int64)
             y = y.repeat(1, repeats)
             token_ids = token_ids.repeat(repeats)
             up_durations = up_durations.repeat(repeats)
@@ -474,12 +508,15 @@ class TTSCtxDatasetSegment(Dataset):
         assert total_frames - num_frames + 1 > 0, (
             f"y length {y.size(-1)}, total_frames {total_frames}, num_frames {num_frames}")
         if self.train:
-            start_frame = np.random.randint(low=0, high=total_frames - num_frames + 1)
+            start_frame = np.random.randint(
+                low=0, high=total_frames - num_frames + 1)
             start = start_frame * self.hop_length
             end_frame = start_frame + num_frames
             y_seg = y[:, start: start + self.num_samples]
-            start_phone_idx = torch.searchsorted(cs_durations, start_frame, right=True)
-            end_phone_idx = torch.searchsorted(cs_durations, end_frame, right=False)
+            start_phone_idx = torch.searchsorted(
+                cs_durations, start_frame, right=True)
+            end_phone_idx = torch.searchsorted(
+                cs_durations, end_frame, right=False)
         else:
             # During validation, take always the first segment for determinism
             y_seg = y[:, : self.num_samples]
@@ -487,10 +524,12 @@ class TTSCtxDatasetSegment(Dataset):
             start_frame = 0
             end_frame = start_frame + num_frames
             start_phone_idx = 0
-            end_phone_idx = torch.searchsorted(cs_durations, end_frame, right=False)
+            end_phone_idx = torch.searchsorted(
+                cs_durations, end_frame, right=False)
 
         token_ids = token_ids[start_phone_idx: end_phone_idx + 1]
-        durations = up_durations[start_phone_idx: end_phone_idx + 1].detach().clone()
+        durations = up_durations[start_phone_idx: end_phone_idx +
+                                 1].detach().clone()
         if end_phone_idx != start_phone_idx:
             first_num_frames = cs_durations[start_phone_idx] - start_frame
             last_num_frames = end_frame - cs_durations[end_phone_idx - 1]
@@ -505,9 +544,11 @@ class TTSCtxDatasetSegment(Dataset):
             ctx_n_frame = np.random.randint(self.min_context, max_context)
             ctx_start_frame = np.random.randint(0, start_frame - ctx_n_frame)
         elif total_frames - (start_frame + num_frames) > self.min_context:
-            max_context = np.minimum(total_frames - (start_frame + num_frames), self.max_context)
+            max_context = np.minimum(
+                total_frames - (start_frame + num_frames), self.max_context)
             ctx_n_frame = np.random.randint(self.min_context, max_context)
-            ctx_start_frame = np.random.randint(start_frame + num_frames, total_frames - ctx_n_frame)
+            ctx_start_frame = np.random.randint(
+                start_frame + num_frames, total_frames - ctx_n_frame)
         else:
             ctx_start_frame = 0
             ctx_n_frame = self.min_context
@@ -547,7 +588,8 @@ class DurDataset(Dataset):
         k, audio_fp, alignment_fp, *_ = self.filelist[index].split("|")
         if self._cache is None or k not in self._cache:
             alignment = torch.load(alignment_fp, map_location="cpu")
-            token_ids = torch.tensor([self.phone2id[str(tk)] for tk in alignment['tokens']])
+            token_ids = torch.tensor([self.phone2id[str(tk)]
+                                     for tk in alignment['tokens']])
             durations = alignment['durations']
             if self._cache is not None:
                 self._cache[k] = (token_ids, durations)
@@ -633,7 +675,8 @@ if __name__ == "__main__":
     import matplotlib
     import soundfile as sf
     matplotlib.use('TkAgg')
-    LINE_COLORS = ['w', 'r', 'orange', 'k', 'cyan', 'm', 'b', 'lime', 'g', 'brown', 'navy']
+    LINE_COLORS = ['w', 'r', 'orange', 'k', 'cyan',
+                   'm', 'b', 'lime', 'g', 'brown', 'navy']
 
     def spec_to_figure(spec, vmin=None, vmax=None, title='', f0s=None, dur_info=None):
         if isinstance(spec, torch.Tensor):
@@ -662,7 +705,8 @@ if __name__ == "__main__":
                 for i in range(len(dur_pred)):
                     shift = (i % 8) + 1
                     plt.text(dur_pred[i], H + shift * 4, txt[i], ha='right')
-                    plt.vlines(dur_pred[i], H, H * 1.5, colors='r')  # red is pred
+                    plt.vlines(dur_pred[i], H, H * 1.5,
+                               colors='r')  # red is pred
                 plt.xlim(0, max(dur_gt[-1], dur_pred[-1]))
         if f0s is not None:
             ax = plt.gca()

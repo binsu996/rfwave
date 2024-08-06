@@ -9,7 +9,7 @@ import wandb
 import torchaudio
 
 from torch import nn
-from rfwave.feature_extractors import FeatureExtractor
+from rfwave.feature_extractors import FeatureExtractor, EncodecFeatures
 from rfwave.heads import FourierHead
 from rfwave.helpers import plot_spectrogram_to_numpy, save_figure_to_numpy
 from rfwave.loss import MelSpecReconstructionLoss
@@ -26,7 +26,7 @@ from rfwave.feature_weight import get_feature_weight, get_feature_weight2
 
 class RectifiedFlow(nn.Module):
     def __init__(self, backbon: Backbone, head: FourierHead,
-                 num_steps=10, feature_loss=False, wave=False, num_bands=8, p_uncond=0., guidance_scale=1.):
+                 num_steps=10, feature_loss=False, wave=False, num_bands=8, p_uncond=0., guidance_scale=1., stft_loss=False):
         super().__init__()
         self.backbone = backbon
         self.head = head
@@ -37,7 +37,7 @@ class RectifiedFlow(nn.Module):
         self.wave = wave
         self.equalizer = wave
         self.stft_norm = not wave
-        self.stft_loss = False
+        self.stft_loss = stft_loss
         self.phase_loss = False
         self.overlap_loss = True
         self.num_bands = num_bands
@@ -448,6 +448,7 @@ class VocosExp(pl.LightningModule):
         initial_learning_rate: float = 2e-4,
         feature_loss: bool = False,
         wave: bool = False,
+        stft_loss: bool = False,
         num_bands: int = 8,
         guidance_scale: float = 1.,
         p_uncond: float = 0.2,
@@ -459,9 +460,12 @@ class VocosExp(pl.LightningModule):
         self.task = task
         self.feature_extractor = feature_extractor
         self.input_adaptor = input_adaptor
+        self.initial_learning_rate = initial_learning_rate
+        self.num_warmup_steps = num_warmup_steps
+        self.sample_rate = sample_rate
         self.reflow = RectifiedFlow(
             backbone, head, feature_loss=feature_loss, wave=wave, num_bands=num_bands,
-            guidance_scale=guidance_scale, p_uncond=p_uncond)
+            guidance_scale=guidance_scale, p_uncond=p_uncond, stft_loss=stft_loss)
         self.aux_loss = False
         self.aux_type = 'mel'
         if self.task == "tts":
@@ -488,11 +492,11 @@ class VocosExp(pl.LightningModule):
         if self.task == 'tts' and self.aux_loss:
             gen_params.append({"params": self.input_adaptor_proj.parameters()})
 
-        opt_gen = torch.optim.AdamW(gen_params, lr=self.hparams.initial_learning_rate)
+        opt_gen = torch.optim.AdamW(gen_params, lr=self.initial_learning_rate)
 
         max_steps = self.trainer.max_steps  # // 2  # Max steps per optimizer
         scheduler_gen = get_cosine_schedule_with_warmup(
-            opt_gen, num_warmup_steps=self.hparams.num_warmup_steps, num_training_steps=max_steps,
+            opt_gen, num_warmup_steps=self.num_warmup_steps, num_training_steps=max_steps,
         )
 
         return [opt_gen], [{"scheduler": scheduler_gen, "interval": "step"}]
@@ -532,9 +536,12 @@ class VocosExp(pl.LightningModule):
         if self.task == 'tts':
             audio_input, phone_info = batch
             phone_info = self.process_context(phone_info)
+            mel = self.feature_extractor(audio_input, **kwargs)
+        elif self.task == 'feature_wave':
+            audio_input, mel = batch
         else:
             audio_input = batch
-        mel = self.feature_extractor(audio_input, **kwargs)
+            mel = self.feature_extractor(audio_input, **kwargs)
         # train generator
         opt_gen = self.optimizers()
         sch_gen = self.lr_schedulers()
@@ -577,10 +584,17 @@ class VocosExp(pl.LightningModule):
         if self.task == 'tts':
             audio_input, phone_info = batch
             phone_info = self.process_context(phone_info)
+            features = self.feature_extractor(audio_input, **kwargs)
+        elif self.task == 'feature_wave':
+            audio_input, features = batch
+            # print(features.shape)
+            # print(audio_input.shape)
+            # features2 = self.feature_extractor(audio_input, **kwargs)
+            # print(features2.shape)
         else:
             audio_input = batch
-        with torch.no_grad():
             features = self.feature_extractor(audio_input, **kwargs)
+        with torch.no_grad():
             cond = self.input_adaptor(*phone_info) if self.task == 'tts' else features
             audio_hat_traj = self.reflow.sample_ode(cond, N=100, **kwargs)
             cond_mel_hat = self.input_adaptor_proj(cond) if self.aux_loss and self.task == 'tts' else None
@@ -626,8 +640,8 @@ class VocosExp(pl.LightningModule):
                 "valid/phase_loss": phase_loss}
             self.logger.log_metrics({**metrics, **rvm_loss_dict}, step=self.global_step)
             self.logger.experiment.log(
-                {"valid_media/audio_in": wandb.Audio(audio_in.data.cpu().numpy(), sample_rate=self.hparams.sample_rate),
-                 "valid_media/audio_hat": wandb.Audio(audio_pred.data.cpu().numpy(), sample_rate=self.hparams.sample_rate),
+                {"valid_media/audio_in": wandb.Audio(audio_in.data.cpu().numpy(), sample_rate=self.sample_rate),
+                 "valid_media/audio_hat": wandb.Audio(audio_pred.data.cpu().numpy(), sample_rate=self.sample_rate),
                  "valid_media/mel_in": wandb.Image(plot_spectrogram_to_numpy(mel_target.data.cpu().numpy())),
                  "valid_media/mel_hat": wandb.Image(plot_spectrogram_to_numpy(mel_hat.data.cpu().numpy()))},
                 step=self.global_step)
@@ -702,9 +716,38 @@ class VocosEncodecExp(VocosExp):
             encodec_audio = self.feature_extractor.encodec(audio_in[None, None, :])
             self.logger.experiment.log(
                 {"valid_media/encodec":
-                     wandb.Audio(encodec_audio[0, 0].data.cpu().numpy(), sample_rate=self.hparams.sample_rate)},
+                     wandb.Audio(encodec_audio[0, 0].data.cpu().numpy(), sample_rate=self.sample_rate)},
                 step=self.global_step-1 if self.global_step > 0 else 0)  # avoid a wired bug in wandb
         super().on_validation_epoch_end(encodec_bandwidth_id=bandwidth_id)
+    
+    @torch.inference_mode()
+    def codes_to_features(self, codes: torch.Tensor) -> torch.Tensor:
+        """
+        Transforms an input sequence of discrete tokens (codes) into feature embeddings using the feature extractor's
+        codebook weights.
+
+        Args:
+            codes (Tensor): The input tensor. Expected shape is (K, L) or (K, B, L),
+                            where K is the number of codebooks, B is the batch size and L is the sequence length.
+
+        Returns:
+            Tensor: Features of shape (B, C, L), where B is the batch size, C denotes the feature dimension,
+                    and L is the sequence length.
+        """
+        assert isinstance(
+            self.feature_extractor, EncodecFeatures
+        ), "Feature extractor should be an instance of EncodecFeatures"
+
+        if codes.dim() == 2:
+            codes = codes.unsqueeze(1)
+
+        n_bins = self.feature_extractor.encodec.quantizer.bins
+        offsets = torch.arange(0, n_bins * len(codes), n_bins, device=codes.device)
+        embeddings_idxs = codes + offsets.view(-1, 1, 1)
+        features = torch.nn.functional.embedding(embeddings_idxs, self.feature_extractor.codebook_weights).sum(dim=0)
+        features = features.transpose(1, 2)
+
+        return features
 
 
 if __name__ == '__main__':
